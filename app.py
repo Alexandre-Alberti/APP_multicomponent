@@ -58,8 +58,119 @@ st.caption(
 
 
 # ============================================================
+# ADAPTIVE NUMERICAL AND OPTIMIZATION SETTINGS
+# ============================================================
+# These parameters are automatically adjusted from the user's input data.
+# The user does not need to configure numerical/optimization details.
+
+ALPHA_UPPER = 0.95
+GLOBAL_TOL = 1e-5
+RENEWAL_TOL = 1e-11
+
+
+def automatic_settings(quantities, lambda_x, beta_h, eta_h):
+    """
+    Choose numerical and optimization settings from the input parameters.
+
+    The goal is to keep the interface simple while still adapting the
+    computation to the scale of the reliability data.
+
+    Main idea:
+    - Use the mean of X_j plus the mean of H_j as a characteristic life scale.
+    - Set the T search interval around that scale.
+    - Choose dt as a fraction of the scale, bounded to avoid excessive runtime.
+    - Use more global iterations for larger models.
+    """
+
+    quantities = np.asarray(quantities, dtype=float)
+    lambda_x = np.asarray(lambda_x, dtype=float)
+    beta_h = np.asarray(beta_h, dtype=float)
+    eta_h = np.asarray(eta_h, dtype=float)
+
+    # Mean of the exponential time-to-defect.
+    mean_x = 1.0 / lambda_x
+
+    # Mean of Weibull delay-time:
+    # E[H] = eta * Gamma(1 + 1 / beta).
+    from scipy.special import gamma
+    mean_h = eta_h * gamma(1.0 + 1.0 / beta_h)
+
+    mean_z = mean_x + mean_h
+
+    # For a series system with many components, the system characteristic
+    # time is shorter than the average component life. This approximation is
+    # only used to define a safe optimization range.
+    total_components = max(float(np.sum(quantities)), 1.0)
+    system_scale = float(np.min(mean_z) / max(total_components ** 0.35, 1.0))
+
+    # Keep bounds broad enough to allow the optimizer to explore.
+    T_lower = max(1.0, 0.02 * system_scale)
+    T_upper = max(50.0, 4.0 * system_scale)
+
+    # Avoid extreme upper bounds that may make the app too slow on Streamlit Cloud.
+    T_upper = min(T_upper, 10000.0)
+
+    # Time grid horizon. Needs to cover T + tau and enough renewal mass.
+    t_max = max(3.0 * T_upper, 2.5 * float(np.max(mean_z)), 10.0 * float(np.max(eta_h)))
+
+    # Adaptive dt: approximately 1200-8000 grid points depending on scale.
+    # Smaller dt improves accuracy but increases runtime.
+    dt = system_scale / 1000.0
+    dt = float(np.clip(dt, 0.05, 2.0))
+
+    # If the grid would still be too large, relax dt.
+    max_grid_points = 12000
+    estimated_points = t_max / dt
+    if estimated_points > max_grid_points:
+        dt = t_max / max_grid_points
+
+    # Quadrature points for opportunity integrations.
+    n_quad = 100
+    if total_components >= 8:
+        n_quad = 80
+    if total_components >= 15:
+        n_quad = 60
+
+    # Renewal settings.
+    max_renewal_terms = 500
+
+    # Optimization effort grows mildly with the number of component types.
+    n_types = len(quantities)
+    global_popsize = int(min(12, max(6, 5 + n_types)))
+    global_maxiter = int(min(50, max(20, 18 + 2 * n_types)))
+    local_maxiter = 800
+
+    return {
+        "T_lower": float(T_lower),
+        "T_upper": float(T_upper),
+        "t_max": float(t_max),
+        "dt": float(dt),
+        "n_quad": int(n_quad),
+        "max_renewal_terms": int(max_renewal_terms),
+        "renewal_tol": float(RENEWAL_TOL),
+        "global_popsize": int(global_popsize),
+        "global_maxiter": int(global_maxiter),
+        "global_tol": float(GLOBAL_TOL),
+        "local_maxiter": int(local_maxiter),
+        "alpha_upper": float(ALPHA_UPPER),
+        "system_scale": float(system_scale),
+        "total_components": int(np.sum(quantities)),
+    }
+
+
+# ============================================================
 # BASIC PROBABILITY FUNCTIONS
 # ============================================================
+
+def integrate_y(y, x):
+    """
+    Numerical integration wrapper compatible with current NumPy versions.
+
+    np.trapz was removed in recent NumPy versions. np.trapezoid is the
+    supported replacement.
+    """
+    return np.trapezoid(y, x)
+
 
 def weibull_pdf(t: np.ndarray, beta: float, eta: float) -> np.ndarray:
     """Return the Weibull probability density function."""
@@ -110,17 +221,9 @@ def build_model(
     The system is assumed to be in series. Several identical components can
     be represented by a single component type with quantity q_j.
 
-    For component type j:
-        q_j      = number of identical components of type j
-        f_j(t)   = density of Z_j = X_j + H_j
-        S_j(t)   = survival function of Z_j
-
     Cause-specific first system failure density:
         phi_j(t) = q_j f_j(t) S_j(t)^(q_j-1)
                    product_{k != j} S_k(t)^q_k
-
-    System first failure density:
-        f_s(t) = sum_j phi_j(t)
 
     Renewal by cause:
         r_j(t) = phi_j(t) + f_s * phi_j(t) + f_s^(2) * phi_j(t) + ...
@@ -153,7 +256,7 @@ def build_model(
         f_z_cdf[j] = cumulative_trapezoid(f_z[j], t, initial=0.0)
         s_z[j] = np.clip(1.0 - f_z_cdf[j], 0.0, 1.0)
 
-        component_masses.append(float(np.trapz(f_z[j], t)))
+        component_masses.append(float(integrate_y(f_z[j], t)))
 
     # Cause-specific first system failure densities.
     phi = np.zeros_like(f_z)
@@ -177,7 +280,7 @@ def build_model(
         phi[j] = own_type_term * survival_other_types
 
     f_s = np.sum(phi, axis=0)
-    system_first_failure_mass = float(np.trapz(f_s, t))
+    system_first_failure_mass = float(integrate_y(f_s, t))
 
     # Renewal calculation by failure cause.
     cause_density = phi.copy()
@@ -192,7 +295,7 @@ def build_model(
             cause_density[j] += fftconvolve(f_power, phi[j])[:n_grid] * dt
 
         f_power_next = fftconvolve(f_power, f_s)[:n_grid] * dt
-        added_mass = float(np.trapz(f_power_next, t))
+        added_mass = float(integrate_y(f_power_next, t))
         f_power = f_power_next
 
         if r <= 5 or r % 25 == 0:
@@ -244,16 +347,7 @@ def make_cost_functions(
     mu: float,
     n_quad: int,
 ):
-    """
-    Create model cost functions for a fixed numerical grid.
-
-    The cost-rate is based on:
-        EC_cycle = pi_i EC_i + pi_o EC_o
-        EV_cycle = pi_i EV_i + pi_o EV_o
-
-    Opportunity-related integrals use the raw density:
-        f_w(w) = mu exp(-mu w)
-    """
+    """Create model cost functions for a fixed numerical grid."""
 
     cef = np.asarray(cef, dtype=float)
     n_types = len(cef)
@@ -286,7 +380,7 @@ def make_cost_functions(
             ]
         )
 
-        return float(q * no_opp + np.trapz(integrand, w))
+        return float(q * no_opp + integrate_y(integrand, w))
 
     def ev_i(T: float, tau: float) -> float:
         """Expected duration of a cycle beginning at a scheduled intervention."""
@@ -298,7 +392,7 @@ def make_cost_functions(
         w = np.linspace(0.0, tau, n_quad)
         ages = T - tau + w
 
-        return float(q * T + np.trapz(opportunity_pdf(w, mu) * ages, w))
+        return float(q * T + integrate_y(opportunity_pdf(w, mu) * ages, w))
 
     def ec_o(T: float, tau: float) -> float:
         """Expected cost of a cycle beginning at an opportunistic intervention."""
@@ -318,7 +412,7 @@ def make_cost_functions(
                 for wi in w
             ]
         )
-        cost_oi = q * np.trapz(integrand_oi, w)
+        cost_oi = q * integrate_y(integrand_oi, w)
 
         # Transition o -> o
         matrix = np.zeros((len(w), len(y)), dtype=float)
@@ -334,8 +428,8 @@ def make_cost_functions(
                     * (co + failure_cost_until(age))
                 )
 
-        inner = np.trapz(matrix, y, axis=1)
-        cost_oo = np.trapz(inner, w)
+        inner = np.trapezoid(matrix, y, axis=1)
+        cost_oo = integrate_y(inner, w)
 
         return float(cost_oi + cost_oo)
 
@@ -351,7 +445,7 @@ def make_cost_functions(
 
         # Transition o -> i
         integrand_oi = opportunity_pdf(w, mu) * (T + tau - w)
-        dur_oi = q * np.trapz(integrand_oi, w)
+        dur_oi = q * integrate_y(integrand_oi, w)
 
         # Transition o -> o
         matrix = np.zeros((len(w), len(y)), dtype=float)
@@ -366,8 +460,8 @@ def make_cost_functions(
                     * (T + yk - wi)
                 )
 
-        inner = np.trapz(matrix, y, axis=1)
-        dur_oo = np.trapz(inner, w)
+        inner = np.trapezoid(matrix, y, axis=1)
+        dur_oo = integrate_y(inner, w)
 
         return float(dur_oi + dur_oo)
 
@@ -399,13 +493,7 @@ def make_cost_functions(
 
 def optimize_policy(
     cost_rate,
-    T_lower: float,
-    T_upper: float,
-    alpha_upper: float,
-    global_popsize: int,
-    global_maxiter: int,
-    global_tol: float,
-    local_maxiter: int,
+    settings,
     progress_container=None,
 ):
     """Run global search followed by local refinement."""
@@ -464,17 +552,17 @@ def optimize_policy(
         return value
 
     bounds = [
-        (T_lower, T_upper),
-        (0.0, alpha_upper),
+        (settings["T_lower"], settings["T_upper"]),
+        (0.0, settings["alpha_upper"]),
     ]
 
     result_global = differential_evolution(
         global_objective,
         bounds=bounds,
         seed=123,
-        popsize=global_popsize,
-        maxiter=global_maxiter,
-        tol=global_tol,
+        popsize=settings["global_popsize"],
+        maxiter=settings["global_maxiter"],
+        tol=settings["global_tol"],
         polish=False,
         updating="immediate",
         workers=1,
@@ -500,7 +588,7 @@ def optimize_policy(
         options={
             "xatol": 1e-6,
             "fatol": 1e-8,
-            "maxiter": local_maxiter,
+            "maxiter": settings["local_maxiter"],
             "disp": False,
         },
     )
@@ -676,108 +764,10 @@ st.dataframe(input_df, use_container_width=True, hide_index=True)
 
 st.divider()
 
-st.header("Numerical and optimization settings")
-
-c1, c2, c3, c4 = st.columns(4)
-
-with c1:
-    dt = st.number_input(
-        "Time step (dt)",
-        min_value=0.01,
-        value=0.25,
-        step=0.05,
-        format="%.4f",
-        help="Smaller values increase numerical accuracy but also increase runtime.",
-    )
-
-with c2:
-    T_upper = st.number_input(
-        "Upper bound for T",
-        min_value=10.0,
-        value=800.0,
-        step=50.0,
-        help="Maximum scheduled inspection interval considered by the optimizer.",
-    )
-
-with c3:
-    t_max_multiplier = st.number_input(
-        "Grid horizon multiplier",
-        min_value=1.5,
-        value=3.0,
-        step=0.5,
-        help="The numerical grid horizon is t_max = multiplier × upper bound for T.",
-    )
-
-with c4:
-    n_quad = st.number_input(
-        "Quadrature points",
-        min_value=20,
-        max_value=500,
-        value=100,
-        step=10,
-        help="Number of points used to integrate opportunity-related terms.",
-    )
-
-c5, c6, c7, c8 = st.columns(4)
-
-with c5:
-    max_renewal_terms = st.number_input(
-        "Max renewal terms",
-        min_value=10,
-        max_value=2000,
-        value=500,
-        step=50,
-    )
-
-with c6:
-    renewal_tol = st.number_input(
-        "Renewal tolerance",
-        min_value=1e-15,
-        value=1e-11,
-        step=1e-11,
-        format="%.1e",
-    )
-
-with c7:
-    global_maxiter = st.number_input(
-        "Global search iterations",
-        min_value=1,
-        max_value=200,
-        value=25,
-        step=5,
-    )
-
-with c8:
-    global_popsize = st.number_input(
-        "Global population size",
-        min_value=2,
-        max_value=30,
-        value=8,
-        step=1,
-    )
-
-c9, c10 = st.columns(2)
-
-with c9:
-    local_maxiter = st.number_input(
-        "Local refinement iterations",
-        min_value=50,
-        max_value=3000,
-        value=800,
-        step=50,
-    )
-
-with c10:
-    alpha_upper = st.number_input(
-        "Upper bound for tau/T",
-        min_value=0.1,
-        max_value=0.99,
-        value=0.95,
-        step=0.01,
-        format="%.2f",
-    )
-
-st.divider()
+st.info(
+    "Numerical and optimization settings are selected automatically from the input data. "
+    "This keeps the interface simple while adapting the grid and search range to the reliability scale."
+)
 
 run_button = st.button("Run optimization", type="primary")
 
@@ -795,7 +785,32 @@ if run_button:
     eta_h = np.asarray(eta_h, dtype=float)
     cef = np.asarray(cef, dtype=float)
 
-    t_max = float(t_max_multiplier * T_upper)
+    settings = automatic_settings(
+        quantities=quantities,
+        lambda_x=lambda_x,
+        beta_h=beta_h,
+        eta_h=eta_h,
+    )
+
+    t_max = settings["t_max"]
+
+    st.subheader("Automatic numerical settings")
+
+    settings_df = pd.DataFrame(
+        [
+            {"Setting": "Characteristic system scale", "Value": settings["system_scale"]},
+            {"Setting": "Total number of components", "Value": settings["total_components"]},
+            {"Setting": "Lower bound for T", "Value": settings["T_lower"]},
+            {"Setting": "Upper bound for T", "Value": settings["T_upper"]},
+            {"Setting": "Grid horizon", "Value": settings["t_max"]},
+            {"Setting": "Time step dt", "Value": settings["dt"]},
+            {"Setting": "Quadrature points", "Value": settings["n_quad"]},
+            {"Setting": "Global search iterations", "Value": settings["global_maxiter"]},
+            {"Setting": "Global population size", "Value": settings["global_popsize"]},
+        ]
+    )
+
+    st.dataframe(settings_df, use_container_width=True, hide_index=True)
 
     st.subheader("Model construction")
 
@@ -814,10 +829,10 @@ if run_button:
             lambda_x=lambda_x,
             beta_h=beta_h,
             eta_h=eta_h,
-            dt=float(dt),
+            dt=settings["dt"],
             t_max=t_max,
-            max_renewal_terms=int(max_renewal_terms),
-            renewal_tol=float(renewal_tol),
+            max_renewal_terms=settings["max_renewal_terms"],
+            renewal_tol=settings["renewal_tol"],
         )
 
         st.write("Model construction completed.")
@@ -857,7 +872,7 @@ if run_button:
         co=float(co),
         cf=float(cf),
         mu=float(mu),
-        n_quad=int(n_quad),
+        n_quad=settings["n_quad"],
     )
 
     st.subheader("Optimization progress")
@@ -875,13 +890,7 @@ if run_button:
 
         results = optimize_policy(
             cost_rate=cost_rate,
-            T_lower=20.0,
-            T_upper=float(T_upper),
-            alpha_upper=float(alpha_upper),
-            global_popsize=int(global_popsize),
-            global_maxiter=int(global_maxiter),
-            global_tol=1e-5,
-            local_maxiter=int(local_maxiter),
+            settings=settings,
             progress_container=progress_container,
         )
 
@@ -962,7 +971,7 @@ if run_button:
         result_periodic = minimize(
             periodic_objective,
             x0=np.array([T_star]),
-            bounds=[(20.0, float(T_upper))],
+            bounds=[(settings["T_lower"], settings["T_upper"])],
             method="L-BFGS-B",
         )
 
@@ -1028,8 +1037,8 @@ if run_button:
                 eta_h=eta_h,
                 dt=float(dt_test),
                 t_max=t_max,
-                max_renewal_terms=int(max_renewal_terms),
-                renewal_tol=float(renewal_tol),
+                max_renewal_terms=settings["max_renewal_terms"],
+                renewal_tol=settings["renewal_tol"],
             )
 
             cr_test, _, _, _, _ = make_cost_functions(
@@ -1040,7 +1049,7 @@ if run_button:
                 co=float(co),
                 cf=float(cf),
                 mu=float(mu),
-                n_quad=int(n_quad),
+                n_quad=settings["n_quad"],
             )
 
             C_test = cr_test(T_star, tau_star)
