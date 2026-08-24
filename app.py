@@ -228,8 +228,6 @@ def build_model(quantities, lambda_x, beta_h, eta_h, dt, t_max,
 # ============================================================
 # COST MODEL
 # ============================================================
-pi_i = prob_no_opportunity(tau, mu)
-pi_o = 1.0 - pi_i
 
 def make_cost_functions(t, M_j_grid, cef, ci, co, cf, mu, n_quad):
     cef = np.asarray(cef, dtype=float)
@@ -269,6 +267,7 @@ def make_cost_functions(t, M_j_grid, cef, ci, co, cf, mu, n_quad):
             return float(ci + failure_cost_until(T))
 
         q = prob_no_opportunity(tau, mu)
+        pi_o = 1.0 - q
         w = np.linspace(0.0, tau, n_quad)
         y = np.linspace(0.0, tau, n_quad)
         fw = opportunity_pdf(w, mu)
@@ -296,6 +295,7 @@ def make_cost_functions(t, M_j_grid, cef, ci, co, cf, mu, n_quad):
             return float(T)
 
         q = prob_no_opportunity(tau, mu)
+        pi_o = 1.0 - q
         w = np.linspace(0.0, tau, n_quad)
         y = np.linspace(0.0, tau, n_quad)
         fw = opportunity_pdf(w, mu)
