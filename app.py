@@ -73,18 +73,28 @@ def automatic_settings(quantities, lambda_x, beta_h, eta_h, required_horizon=Non
     T_lower = max(1e-3, 0.02 * system_scale)
     T_upper = min(max(50.0, 4.0 * system_scale), 10000.0)
 
+    # Tail-based horizon. Using only multiples of the mean can truncate a
+    # non-negligible part of Z = X + H, especially for long-tailed Weibull H.
+    tail_prob = 1e-8
+    x_tail = -np.log(tail_prob) / lambda_x
+    h_tail = eta_h * (-np.log(tail_prob)) ** (1.0 / beta_h)
+
+    # If X <= x_tail and H <= h_tail, then Z <= x_tail + h_tail.
+    # By the union bound, the omitted component probability is at most
+    # approximately 2*tail_prob before discretization error.
+    z_tail = x_tail + h_tail
+
     t_max = max(
         2.2 * T_upper,
-        3.0 * float(np.max(mean_z)),
-        12.0 * float(np.max(eta_h)),
+        float(np.max(z_tail)),
     )
 
     if required_horizon is not None:
         t_max = max(t_max, 1.20 * float(required_horizon))
         T_upper = max(T_upper, min(float(required_horizon), 10000.0))
 
-    dt = float(np.clip(system_scale / 1500.0, 0.02, 1.0))
-    max_grid_points = 20000
+    dt = float(np.clip(system_scale / 2000.0, 0.01, 0.5))
+    max_grid_points = 50000
     if t_max / dt > max_grid_points:
         dt = t_max / max_grid_points
 
@@ -673,66 +683,94 @@ if run:
         t, M_j, cef_np, float(ci), float(co), float(cf), float(mu), settings["n_quad"]
     )
 
-    with st.expander("Numerical checks", expanded=False):
-        check_df = pd.DataFrame({
-            "Component type": [f"Type {i+1}" for i in range(int(n_types))],
-            "Integral of f_Z over numerical grid": info["component_masses"],
-        })
-        st.dataframe(check_df, use_container_width=True, hide_index=True)
-        st.write(f"System first-failure density mass over grid: {info['system_first_failure_mass']:.8f}")
-        st.write(f"Numerical grid: {info['n_grid']} points; dt = {info['dt']:.6g}; horizon = {info['t_max']:.6g}")
-        st.write(f"Renewal summation stopped at convolution order: {info['renewal_stop_term']}")
+    def show_numerical_checks(info, result, tolerance=1e-4):
+        with st.expander("Numerical checks", expanded=False):
+            st.markdown("#### Distribution-mass checks")
 
-    def show_probability_check(result, tolerance=1e-4):
-        st.markdown("#### Transition-probability consistency check")
+            masses = np.asarray(info["component_masses"], dtype=float)
+            mass_errors = np.abs(masses - 1.0)
+            check_df = pd.DataFrame({
+                "Component type": [f"Type {i+1}" for i in range(int(n_types))],
+                "Integral of f_Z over numerical grid": masses,
+                "Absolute error from 1": mass_errors,
+                "Status": np.where(mass_errors <= tolerance, "OK", "Check"),
+            })
+            st.dataframe(check_df, use_container_width=True, hide_index=True)
 
-        sum_I = result["P_II + P_IO"]
-        sum_O = result["P_OI + P_OO"]
+            system_mass = float(info["system_first_failure_mass"])
+            system_error = abs(system_mass - 1.0)
+            st.write(
+                f"System first-failure density mass over grid: {system_mass:.10f} "
+                f"(error from 1 = {system_error:.3e})"
+            )
 
-        probability_df = pd.DataFrame({
-            "Transition": ["P_II", "P_IO", "P_OI", "P_OO"],
-            "Probability": [
-                result["P_II"], result["P_IO"],
-                result["P_OI"], result["P_OO"],
-            ],
-        })
-        st.dataframe(probability_df, use_container_width=True, hide_index=True)
+            st.markdown("#### Transition-probability consistency checks")
 
-        c1, c2 = st.columns(2)
-        c1.metric("P_II + P_IO", f"{sum_I:.10f}")
-        if np.isfinite(sum_O):
-            c2.metric("P_OI + P_OO", f"{sum_O:.10f}")
-        else:
-            c2.metric("P_OI + P_OO", "N/A")
+            sum_I = result["P_II + P_IO"]
+            sum_O = result["P_OI + P_OO"]
 
-        error_I = abs(sum_I - 1.0)
-        ok_I = error_I <= tolerance
-        ok_O = np.isfinite(sum_O) and abs(sum_O - 1.0) <= tolerance
+            probability_df = pd.DataFrame({
+                "Transition": ["P_II", "P_IO", "P_OI", "P_OO"],
+                "Probability": [
+                    result["P_II"], result["P_IO"],
+                    result["P_OI"], result["P_OO"],
+                ],
+            })
+            st.dataframe(probability_df, use_container_width=True, hide_index=True)
 
-        if result["tau"] <= 0.0:
-            if ok_I:
+            row_data = [
+                {
+                    "Probability sum": "P_II + P_IO",
+                    "Value": sum_I,
+                    "Absolute error from 1": abs(sum_I - 1.0),
+                    "Status": "OK" if abs(sum_I - 1.0) <= tolerance else "Check",
+                }
+            ]
+
+            if np.isfinite(sum_O):
+                row_data.append({
+                    "Probability sum": "P_OI + P_OO",
+                    "Value": sum_O,
+                    "Absolute error from 1": abs(sum_O - 1.0),
+                    "Status": "OK" if abs(sum_O - 1.0) <= tolerance else "Check",
+                })
+            else:
+                row_data.append({
+                    "Probability sum": "P_OI + P_OO",
+                    "Value": np.nan,
+                    "Absolute error from 1": np.nan,
+                    "Status": "N/A (τ = 0)",
+                })
+
+            st.dataframe(pd.DataFrame(row_data), use_container_width=True, hide_index=True)
+
+            all_mass_ok = bool(np.all(mass_errors <= tolerance))
+            system_ok = system_error <= tolerance
+            prob_I_ok = abs(sum_I - 1.0) <= tolerance
+            prob_O_ok = (result["tau"] <= 0.0) or (
+                np.isfinite(sum_O) and abs(sum_O - 1.0) <= tolerance
+            )
+
+            if all_mass_ok and system_ok and prob_I_ok and prob_O_ok:
                 st.success(
-                    f"Probability check OK for state I: P_II + P_IO = {sum_I:.10f}. "
-                    "State O is unreachable when τ = 0, so the O-row check is not applicable."
+                    f"All numerical checks are within tolerance ({tolerance:g})."
                 )
             else:
+                warnings = []
+                if not all_mass_ok:
+                    warnings.append("one or more component failure-time densities do not integrate sufficiently close to 1")
+                if not system_ok:
+                    warnings.append("the system first-failure density does not integrate sufficiently close to 1")
+                if not prob_I_ok or not prob_O_ok:
+                    warnings.append("one or more transition-probability rows do not sum sufficiently close to 1")
                 st.warning(
-                    f"Probability check warning: P_II + P_IO = {sum_I:.10f} "
-                    f"(error = {error_I:.3e})."
+                    "Numerical check warning: " + "; ".join(warnings) + "."
                 )
-        elif ok_I and ok_O:
-            st.success(
-                "Probability check OK: both transition rows sum to 1 within "
-                f"the numerical tolerance ({tolerance:g})."
-            )
-        else:
-            errors = [f"I-row error = {error_I:.3e}"]
-            if np.isfinite(sum_O):
-                errors.append(f"O-row error = {abs(sum_O - 1.0):.3e}")
-            st.warning(
-                "Transition probabilities do not close sufficiently close to 1. "
-                + "; ".join(errors)
-                + ". Consider increasing the quadrature resolution."
+
+            st.caption(
+                f"Grid: {info['n_grid']} points; dt = {info['dt']:.6g}; "
+                f"horizon = {info['t_max']:.6g}; renewal summation stopped at "
+                f"convolution order {info['renewal_stop_term']}."
             )
 
     if mode == "Evaluate a specified T and τ":
@@ -764,7 +802,7 @@ if run:
             ]
         })
         st.dataframe(details, use_container_width=True, hide_index=True)
-        show_probability_check(result)
+        show_numerical_checks(info, result)
 
     else:
         st.subheader("Optimization progress")
@@ -797,7 +835,7 @@ if run:
             ]
         })
         st.dataframe(details, use_container_width=True, hide_index=True)
-        show_probability_check(result)
+        show_numerical_checks(info, result)
 
         with st.expander("Tested solutions", expanded=False):
             st.dataframe(opt["log"], use_container_width=True, hide_index=True)
