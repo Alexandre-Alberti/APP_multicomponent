@@ -228,6 +228,8 @@ def build_model(quantities, lambda_x, beta_h, eta_h, dt, t_max,
 # ============================================================
 # COST MODEL
 # ============================================================
+pi_i = prob_no_opportunity(tau, mu)
+pi_o = 1.0 - pi_i
 
 def make_cost_functions(t, M_j_grid, cef, ci, co, cf, mu, n_quad):
     cef = np.asarray(cef, dtype=float)
@@ -287,7 +289,7 @@ def make_cost_functions(t, M_j_grid, cef, ci, co, cf, mu, n_quad):
             )
         cost_oo = integrate_y(np.trapezoid(matrix, y, axis=1), w)
 
-        return float(cost_oi + cost_oo)
+        return float((cost_oi + cost_oo)/pi_o)
 
     def ev_o(T, tau):
         if tau <= 0.0:
@@ -306,7 +308,7 @@ def make_cost_functions(t, M_j_grid, cef, ci, co, cf, mu, n_quad):
             matrix[i, :] = fw[i] * fy * (T + y - wi)
         dur_oo = integrate_y(np.trapezoid(matrix, y, axis=1), w)
 
-        return float(dur_oi + dur_oo)
+        return float((dur_oi + dur_oo)/pi_o)
 
     def performance(T, tau):
         if T <= 0:
