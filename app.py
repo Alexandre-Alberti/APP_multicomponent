@@ -1,37 +1,4 @@
-"""
-T-tau Opportunistic Inspection Model
-====================================
-
-Streamlit app for optimizing a quasi-periodic opportunistic inspection policy
-for multi-component systems under the delay-time framework.
-
-How to run locally
-------------------
-1. Install dependencies:
-       pip install -r requirements.txt
-
-2. Run:
-       streamlit run app.py
-
-Main assumptions
-----------------
-- Series system configuration.
-- The system may contain different component types.
-- Each component type may represent several identical components.
-- Time-to-defect:
-       X_j ~ Exponential(lambda_j)
-- Delay-time:
-       H_j ~ Weibull(beta_j, eta_j)
-- Time-to-failure:
-       Z_j = X_j + H_j
-- Exogenous opportunities arrive according to a Homogeneous Poisson Process.
-- The policy is defined by:
-       T   = scheduled inspection interval
-       tau = opportunistic inspection window
-"""
-
 import time
-
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -39,106 +6,91 @@ import streamlit as st
 from scipy.integrate import cumulative_trapezoid
 from scipy.optimize import differential_evolution, minimize
 from scipy.signal import fftconvolve
-
+from scipy.special import gamma
 
 # ============================================================
-# PAGE CONFIGURATION
+# PAGE
 # ============================================================
 
-st.set_page_config(
-    page_title="T-tau Opportunistic Inspection Model",
-    layout="wide",
-)
-
-st.title("T–τ Opportunistic Inspection Model")
+st.set_page_config(page_title="T–τ Opportunistic Inspection Policy", layout="wide")
+st.title("T–τ Opportunistic Inspection Policy")
 st.caption(
-    "Quasi-periodic inspection and preventive maintenance optimization "
-    "for multi-component systems under the delay-time framework."
+    "Evaluation and optimization of a quasi-periodic opportunistic inspection "
+    "policy for a multi-component series system under the delay-time framework."
 )
 
-
-# ============================================================
-# ADAPTIVE NUMERICAL AND OPTIMIZATION SETTINGS
-# ============================================================
-# These parameters are automatically adjusted from the user's input data.
-# The user does not need to configure numerical/optimization details.
-
-ALPHA_UPPER = 0.95
 GLOBAL_TOL = 1e-5
-RENEWAL_TOL = 1e-11
+RENEWAL_TOL = 1e-10
+ALPHA_UPPER = 0.999
 
 
-def automatic_settings(quantities, lambda_x, beta_h, eta_h):
-    """
-    Choose numerical and optimization settings from the input parameters.
+# ============================================================
+# PROBABILITY FUNCTIONS
+# ============================================================
 
-    The goal is to keep the interface simple while still adapting the
-    computation to the scale of the reliability data.
+def exponential_pdf(t, lam):
+    """PDF of X ~ Exponential(lam), where X is the time to defect arrival."""
+    return lam * np.exp(-lam * t)
 
-    Main idea:
-    - Use the mean of X_j plus the mean of H_j as a characteristic life scale.
-    - Set the T search interval around that scale.
-    - Choose dt as a fraction of the scale, bounded to avoid excessive runtime.
-    - Use more global iterations for larger models.
-    """
 
+def weibull_cdf(t, beta, eta):
+    """CDF of H ~ Weibull(beta, eta), where H is the delay time to failure."""
+    t = np.asarray(t, dtype=float)
+    return 1.0 - np.exp(-(np.maximum(t, 0.0) / eta) ** beta)
+
+
+def opportunity_pdf(w, mu):
+    """Density of the waiting time to an external opportunity."""
+    return mu * np.exp(-mu * w)
+
+
+def prob_no_opportunity(tau, mu):
+    """Probability of no opportunity in a window of length tau."""
+    return float(np.exp(-mu * tau))
+
+
+def integrate_y(y, x):
+    return np.trapezoid(y, x)
+
+
+# ============================================================
+# AUTOMATIC NUMERICAL SETTINGS
+# ============================================================
+
+def automatic_settings(quantities, lambda_x, beta_h, eta_h, required_horizon=None):
     quantities = np.asarray(quantities, dtype=float)
     lambda_x = np.asarray(lambda_x, dtype=float)
     beta_h = np.asarray(beta_h, dtype=float)
     eta_h = np.asarray(eta_h, dtype=float)
 
-    # Mean of the exponential time-to-defect.
     mean_x = 1.0 / lambda_x
-
-    # Mean of Weibull delay-time:
-    # E[H] = eta * Gamma(1 + 1 / beta).
-    from scipy.special import gamma
     mean_h = eta_h * gamma(1.0 + 1.0 / beta_h)
-
     mean_z = mean_x + mean_h
 
-    # For a series system with many components, the system characteristic
-    # time is shorter than the average component life. This approximation is
-    # only used to define a safe optimization range.
     total_components = max(float(np.sum(quantities)), 1.0)
     system_scale = float(np.min(mean_z) / max(total_components ** 0.35, 1.0))
 
-    # Keep bounds broad enough to allow the optimizer to explore.
-    T_lower = max(1.0, 0.02 * system_scale)
-    T_upper = max(50.0, 4.0 * system_scale)
+    T_lower = max(1e-3, 0.02 * system_scale)
+    T_upper = min(max(50.0, 4.0 * system_scale), 10000.0)
 
-    # Avoid extreme upper bounds that may make the app too slow on Streamlit Cloud.
-    T_upper = min(T_upper, 10000.0)
+    t_max = max(
+        2.2 * T_upper,
+        3.0 * float(np.max(mean_z)),
+        12.0 * float(np.max(eta_h)),
+    )
 
-    # Time grid horizon. Needs to cover T + tau and enough renewal mass.
-    t_max = max(3.0 * T_upper, 2.5 * float(np.max(mean_z)), 10.0 * float(np.max(eta_h)))
+    if required_horizon is not None:
+        t_max = max(t_max, 1.20 * float(required_horizon))
+        T_upper = max(T_upper, min(float(required_horizon), 10000.0))
 
-    # Adaptive dt: approximately 1200-8000 grid points depending on scale.
-    # Smaller dt improves accuracy but increases runtime.
-    dt = system_scale / 1000.0
-    dt = float(np.clip(dt, 0.05, 2.0))
-
-    # If the grid would still be too large, relax dt.
-    max_grid_points = 12000
-    estimated_points = t_max / dt
-    if estimated_points > max_grid_points:
+    dt = float(np.clip(system_scale / 1500.0, 0.02, 1.0))
+    max_grid_points = 20000
+    if t_max / dt > max_grid_points:
         dt = t_max / max_grid_points
 
-    # Quadrature points for opportunity integrations.
-    n_quad = 100
-    if total_components >= 8:
-        n_quad = 80
-    if total_components >= 15:
-        n_quad = 60
-
-    # Renewal settings.
-    max_renewal_terms = 500
-
-    # Optimization effort grows mildly with the number of component types.
+    ncomp = int(np.sum(quantities))
+    n_quad = 140 if ncomp < 8 else 110 if ncomp < 15 else 80
     n_types = len(quantities)
-    global_popsize = int(min(12, max(6, 5 + n_types)))
-    global_maxiter = int(min(50, max(20, 18 + 2 * n_types)))
-    local_maxiter = 800
 
     return {
         "T_lower": float(T_lower),
@@ -146,90 +98,44 @@ def automatic_settings(quantities, lambda_x, beta_h, eta_h):
         "t_max": float(t_max),
         "dt": float(dt),
         "n_quad": int(n_quad),
-        "max_renewal_terms": int(max_renewal_terms),
-        "renewal_tol": float(RENEWAL_TOL),
-        "global_popsize": int(global_popsize),
-        "global_maxiter": int(global_maxiter),
-        "global_tol": float(GLOBAL_TOL),
-        "local_maxiter": int(local_maxiter),
-        "alpha_upper": float(ALPHA_UPPER),
-        "system_scale": float(system_scale),
-        "total_components": int(np.sum(quantities)),
+        "max_renewal_terms": 500,
+        "renewal_tol": RENEWAL_TOL,
+        "global_popsize": int(min(14, max(7, 6 + n_types))),
+        "global_maxiter": int(min(60, max(25, 22 + 2 * n_types))),
+        "global_tol": GLOBAL_TOL,
+        "local_maxiter": 1000,
+        "alpha_upper": ALPHA_UPPER,
+        "system_scale": system_scale,
+        "total_components": ncomp,
     }
 
 
 # ============================================================
-# BASIC PROBABILITY FUNCTIONS
+# RELIABILITY AND RENEWAL MODEL
 # ============================================================
 
-def integrate_y(y, x):
+def build_model(quantities, lambda_x, beta_h, eta_h, dt, t_max,
+                max_renewal_terms, renewal_tol):
     """
-    Numerical integration wrapper compatible with current NumPy versions.
+    X_j ~ Exponential(lambda_j): time to defect arrival.
+    H_j ~ Weibull(beta_j, eta_j): delay time from defect to failure.
+    Z_j = X_j + H_j: total time to component failure.
 
-    np.trapz was removed in recent NumPy versions. np.trapezoid is the
-    supported replacement.
+    F_Z is evaluated as f_X * F_H. This is mathematically equivalent to
+    obtaining f_Z = f_X * f_H and then integrating, but is numerically more
+    stable when beta < 1 because the Weibull density is singular at zero.
+
+    For a series system:
+        phi_j(t) = q_j f_Zj(t) S_Zj(t)^(q_j-1)
+                   prod_{k != j} S_Zk(t)^q_k
+
+        f_S(t) = sum_j phi_j(t)
+
+    The cause-specific renewal density is:
+        r_j = phi_j + f_S*phi_j + f_S^(2)*phi_j + ...
+
+    and M_j(t) = integral_0^t r_j(u) du.
     """
-    return np.trapezoid(y, x)
-
-
-def weibull_pdf(t: np.ndarray, beta: float, eta: float) -> np.ndarray:
-    """Return the Weibull probability density function."""
-    f = np.zeros_like(t, dtype=float)
-    positive = t > 0
-
-    f[positive] = (
-        (beta / eta)
-        * (t[positive] / eta) ** (beta - 1.0)
-        * np.exp(-(t[positive] / eta) ** beta)
-    )
-
-    return f
-
-
-def exponential_pdf(t: np.ndarray, lam: float) -> np.ndarray:
-    """Return the exponential probability density function."""
-    return lam * np.exp(-lam * t)
-
-
-def opportunity_pdf(w: np.ndarray | float, mu: float) -> np.ndarray | float:
-    """Return the raw density f_w(w) = mu exp(-mu w)."""
-    return mu * np.exp(-mu * w)
-
-
-def prob_no_opportunity(tau: float, mu: float) -> float:
-    """Return the probability of no opportunity in a window of length tau."""
-    return float(np.exp(-mu * tau))
-
-
-# ============================================================
-# NUMERICAL MODEL CONSTRUCTION
-# ============================================================
-
-def build_model(
-    quantities: np.ndarray,
-    lambda_x: np.ndarray,
-    beta_h: np.ndarray,
-    eta_h: np.ndarray,
-    dt: float,
-    t_max: float,
-    max_renewal_terms: int,
-    renewal_tol: float,
-):
-    """
-    Build all numerical curves required by the model.
-
-    The system is assumed to be in series. Several identical components can
-    be represented by a single component type with quantity q_j.
-
-    Cause-specific first system failure density:
-        phi_j(t) = q_j f_j(t) S_j(t)^(q_j-1)
-                   product_{k != j} S_k(t)^q_k
-
-    Renewal by cause:
-        r_j(t) = phi_j(t) + f_s * phi_j(t) + f_s^(2) * phi_j(t) + ...
-        M_j(t) = integral_0^t r_j(u) du
-    """
-
     start = time.perf_counter()
 
     quantities = np.asarray(quantities, dtype=float)
@@ -238,57 +144,46 @@ def build_model(
     eta_h = np.asarray(eta_h, dtype=float)
 
     n_types = len(quantities)
-
     t = np.arange(0.0, t_max + dt, dt)
     n_grid = len(t)
 
-    f_z = np.zeros((n_types, n_grid), dtype=float)
-    f_z_cdf = np.zeros((n_types, n_grid), dtype=float)
-    s_z = np.zeros((n_types, n_grid), dtype=float)
-
+    f_z = np.zeros((n_types, n_grid))
+    F_z = np.zeros((n_types, n_grid))
+    S_z = np.zeros((n_types, n_grid))
     component_masses = []
 
     for j in range(n_types):
         f_x = exponential_pdf(t, lambda_x[j])
-        f_h = weibull_pdf(t, beta_h[j], eta_h[j])
+        F_h = weibull_cdf(t, beta_h[j], eta_h[j])
 
-        f_z[j] = fftconvolve(f_x, f_h)[:n_grid] * dt
-        f_z_cdf[j] = cumulative_trapezoid(f_z[j], t, initial=0.0)
-        s_z[j] = np.clip(1.0 - f_z_cdf[j], 0.0, 1.0)
+        F_raw = fftconvolve(f_x, F_h)[:n_grid] * dt
+        F_raw = np.clip(F_raw, 0.0, 1.0)
+        F_z[j] = np.maximum.accumulate(F_raw)
 
+        f_z[j] = np.maximum(np.gradient(F_z[j], dt, edge_order=2), 0.0)
+        S_z[j] = np.clip(1.0 - F_z[j], 0.0, 1.0)
         component_masses.append(float(integrate_y(f_z[j], t)))
 
-    # Cause-specific first system failure densities.
     phi = np.zeros_like(f_z)
-
     for j in range(n_types):
-        own_type_term = (
-            quantities[j]
-            * f_z[j]
-            * np.power(np.maximum(s_z[j], 1e-15), quantities[j] - 1.0)
+        own = quantities[j] * f_z[j] * np.power(
+            np.maximum(S_z[j], 1e-15), quantities[j] - 1.0
         )
-
-        survival_other_types = np.ones_like(t, dtype=float)
-
+        others = np.ones_like(t)
         for k in range(n_types):
             if k != j:
-                survival_other_types *= np.power(
-                    np.maximum(s_z[k], 1e-15),
-                    quantities[k],
-                )
-
-        phi[j] = own_type_term * survival_other_types
+                others *= np.power(np.maximum(S_z[k], 1e-15), quantities[k])
+        phi[j] = own * others
 
     f_s = np.sum(phi, axis=0)
     system_first_failure_mass = float(integrate_y(f_s, t))
 
-    # Renewal calculation by failure cause.
+    # Renewal series: phi_j + f_s*phi_j + f_s^2*phi_j + ...
     cause_density = phi.copy()
     f_power = f_s.copy()
 
     renewal_stop_term = max_renewal_terms
     renewal_stop_mass = np.nan
-    progress_messages = []
 
     for r in range(1, max_renewal_terms + 1):
         for j in range(n_types):
@@ -298,25 +193,14 @@ def build_model(
         added_mass = float(integrate_y(f_power_next, t))
         f_power = f_power_next
 
-        if r <= 5 or r % 25 == 0:
-            progress_messages.append(
-                f"Renewal term {r}: added mass = {added_mass:.3e}"
-            )
-
         if added_mass < renewal_tol:
-            renewal_stop_term = r
+            renewal_stop_term = r + 1
             renewal_stop_mass = added_mass
-            progress_messages.append(
-                f"Renewal stopped at term {r}. Added mass = {added_mass:.3e}"
-            )
             break
 
-    mj_grid = np.zeros_like(cause_density)
-
+    M_j = np.zeros_like(cause_density)
     for j in range(n_types):
-        mj_grid[j] = cumulative_trapezoid(cause_density[j], t, initial=0.0)
-
-    elapsed = time.perf_counter() - start
+        M_j[j] = cumulative_trapezoid(cause_density[j], t, initial=0.0)
 
     info = {
         "dt": dt,
@@ -326,229 +210,222 @@ def build_model(
         "system_first_failure_mass": system_first_failure_mass,
         "renewal_stop_term": renewal_stop_term,
         "renewal_stop_mass": renewal_stop_mass,
-        "build_time": elapsed,
-        "progress_messages": progress_messages,
+        "build_time": time.perf_counter() - start,
     }
-
-    return t, mj_grid, info
+    return t, M_j, info
 
 
 # ============================================================
-# COST FUNCTIONS
+# COST MODEL
 # ============================================================
 
-def make_cost_functions(
-    t: np.ndarray,
-    mj_grid: np.ndarray,
-    cef: np.ndarray,
-    ci: float,
-    co: float,
-    cf: float,
-    mu: float,
-    n_quad: int,
-):
-    """Create model cost functions for a fixed numerical grid."""
-
+def make_cost_functions(t, M_j_grid, cef, ci, co, cf, mu, n_quad):
     cef = np.asarray(cef, dtype=float)
     n_types = len(cef)
 
-    def mj_at(a: float) -> np.ndarray:
-        """Interpolate M_j(a) for all component types."""
-        a = np.clip(a, 0.0, t[-1])
-        return np.array([np.interp(a, t, mj_grid[j]) for j in range(n_types)])
+    def M_at(a):
+        a = float(np.clip(a, 0.0, t[-1]))
+        return np.array([np.interp(a, t, M_j_grid[j]) for j in range(n_types)])
 
-    def failure_cost_until(a: float) -> float:
-        """Return expected failure-related cost accumulated until age a."""
-        m = mj_at(a)
-        return float(np.sum(m * (cf + cef)))
+    def failure_cost_until(a):
+        # Each failure caused by type j generates base cost Cf plus type-specific CEF_j.
+        return float(np.sum(M_at(a) * (cf + cef)))
 
-    def ec_i(T: float, tau: float) -> float:
-        """Expected cost of a cycle beginning at a scheduled intervention."""
+    def ec_i(T, tau):
         q = prob_no_opportunity(tau, mu)
         no_opp = ci + failure_cost_until(T)
-
         if tau <= 0.0:
             return float(no_opp)
 
         w = np.linspace(0.0, tau, n_quad)
         ages = T - tau + w
-
-        integrand = np.array(
-            [
-                opportunity_pdf(wi, mu) * (co + failure_cost_until(ai))
-                for wi, ai in zip(w, ages)
-            ]
+        integrand = opportunity_pdf(w, mu) * np.array(
+            [co + failure_cost_until(a) for a in ages]
         )
-
         return float(q * no_opp + integrate_y(integrand, w))
 
-    def ev_i(T: float, tau: float) -> float:
-        """Expected duration of a cycle beginning at a scheduled intervention."""
+    def ev_i(T, tau):
         q = prob_no_opportunity(tau, mu)
-
         if tau <= 0.0:
             return float(T)
-
         w = np.linspace(0.0, tau, n_quad)
         ages = T - tau + w
-
         return float(q * T + integrate_y(opportunity_pdf(w, mu) * ages, w))
 
-    def ec_o(T: float, tau: float) -> float:
-        """Expected cost of a cycle beginning at an opportunistic intervention."""
-        q = prob_no_opportunity(tau, mu)
-
+    def ec_o(T, tau):
         if tau <= 0.0:
             return float(ci + failure_cost_until(T))
 
+        q = prob_no_opportunity(tau, mu)
         w = np.linspace(0.0, tau, n_quad)
         y = np.linspace(0.0, tau, n_quad)
+        fw = opportunity_pdf(w, mu)
 
-        # Transition o -> i
-        integrand_oi = np.array(
-            [
-                opportunity_pdf(wi, mu)
-                * (ci + failure_cost_until(T + tau - wi))
-                for wi in w
-            ]
+        # o -> i
+        integrand_oi = fw * np.array(
+            [ci + failure_cost_until(T + tau - wi) for wi in w]
         )
         cost_oi = q * integrate_y(integrand_oi, w)
 
-        # Transition o -> o
-        matrix = np.zeros((len(w), len(y)), dtype=float)
-
+        # o -> o
+        fy = opportunity_pdf(y, mu)
+        matrix = np.zeros((len(w), len(y)))
         for i, wi in enumerate(w):
-            fwi = opportunity_pdf(wi, mu)
-
-            for k, yk in enumerate(y):
-                age = T + yk - wi
-                matrix[i, k] = (
-                    fwi
-                    * opportunity_pdf(yk, mu)
-                    * (co + failure_cost_until(age))
-                )
-
-        inner = np.trapezoid(matrix, y, axis=1)
-        cost_oo = integrate_y(inner, w)
+            ages = T + y - wi
+            matrix[i, :] = fw[i] * fy * np.array(
+                [co + failure_cost_until(a) for a in ages]
+            )
+        cost_oo = integrate_y(np.trapezoid(matrix, y, axis=1), w)
 
         return float(cost_oi + cost_oo)
 
-    def ev_o(T: float, tau: float) -> float:
-        """Expected duration of a cycle beginning at an opportunistic intervention."""
-        q = prob_no_opportunity(tau, mu)
-
+    def ev_o(T, tau):
         if tau <= 0.0:
             return float(T)
 
+        q = prob_no_opportunity(tau, mu)
         w = np.linspace(0.0, tau, n_quad)
         y = np.linspace(0.0, tau, n_quad)
+        fw = opportunity_pdf(w, mu)
 
-        # Transition o -> i
-        integrand_oi = opportunity_pdf(w, mu) * (T + tau - w)
-        dur_oi = q * integrate_y(integrand_oi, w)
+        dur_oi = q * integrate_y(fw * (T + tau - w), w)
 
-        # Transition o -> o
-        matrix = np.zeros((len(w), len(y)), dtype=float)
-
+        fy = opportunity_pdf(y, mu)
+        matrix = np.zeros((len(w), len(y)))
         for i, wi in enumerate(w):
-            fwi = opportunity_pdf(wi, mu)
-
-            for k, yk in enumerate(y):
-                matrix[i, k] = (
-                    fwi
-                    * opportunity_pdf(yk, mu)
-                    * (T + yk - wi)
-                )
-
-        inner = np.trapezoid(matrix, y, axis=1)
-        dur_oo = integrate_y(inner, w)
+            matrix[i, :] = fw[i] * fy * (T + y - wi)
+        dur_oo = integrate_y(np.trapezoid(matrix, y, axis=1), w)
 
         return float(dur_oi + dur_oo)
 
-    def cost_rate(T: float, tau: float) -> float:
-        """Return the long-run expected cost-rate."""
-        if T <= 0.0 or tau < 0.0 or tau >= T:
-            return np.inf
-
+    def performance(T, tau):
+        if T <= 0:
+            raise ValueError("T must be greater than zero.")
+        if tau < 0:
+            raise ValueError("tau cannot be negative.")
+        if tau >= T:
+            raise ValueError("tau must be smaller than T.")
         if T + tau > t[-1]:
-            return np.inf
+            raise ValueError("Numerical horizon is too short for this T and tau.")
 
         pi_i = prob_no_opportunity(tau, mu)
         pi_o = 1.0 - pi_i
 
-        ec_cycle = pi_i * ec_i(T, tau) + pi_o * ec_o(T, tau)
-        ev_cycle = pi_i * ev_i(T, tau) + pi_o * ev_o(T, tau)
+        # ------------------------------------------------------------
+        # Transition-probability consistency check
+        # ------------------------------------------------------------
+        # I -> I: no opportunity occurs in a window of length tau.
+        P_II = pi_i
 
-        if ev_cycle <= 0.0:
+        # I -> O: at least one opportunity occurs in the window.
+        # This is intentionally evaluated by numerical integration so that
+        # the check also detects quadrature inaccuracies.
+        if tau <= 0.0:
+            P_IO = 0.0
+            P_OI = np.nan
+            P_OO = np.nan
+        else:
+            w_check = np.linspace(0.0, tau, n_quad)
+            opportunity_mass = integrate_y(opportunity_pdf(w_check, mu), w_check)
+            P_IO = float(opportunity_mass)
+
+            # The O-state terms in the model are written with the raw
+            # opportunity density. Their total raw mass is pi_o. Dividing
+            # the O->I and O->O masses by that O-state mass gives the
+            # corresponding transition probabilities, without changing the
+            # cost expressions used by the model.
+            raw_P_OI = pi_i * opportunity_mass
+            raw_P_OO = opportunity_mass * opportunity_mass
+            if opportunity_mass > 1e-14:
+                P_OI = float(raw_P_OI / opportunity_mass)
+                P_OO = float(raw_P_OO / opportunity_mass)
+            else:
+                P_OI = np.nan
+                P_OO = np.nan
+
+        sum_I = float(P_II + P_IO)
+        sum_O = float(P_OI + P_OO) if np.isfinite(P_OI) and np.isfinite(P_OO) else np.nan
+
+        EC_i = ec_i(T, tau)
+        EV_i = ev_i(T, tau)
+
+        if pi_o < 1e-14:
+            EC_o = np.nan
+            EV_o = np.nan
+            EC = EC_i
+            EV = EV_i
+        else:
+            EC_o = ec_o(T, tau)
+            EV_o = ev_o(T, tau)
+            EC = pi_i * EC_i + pi_o * EC_o
+            EV = pi_i * EV_i + pi_o * EV_o
+
+        return {
+            "T": float(T),
+            "tau": float(tau),
+            "tau/T": float(tau / T),
+            "pi_i": float(pi_i),
+            "pi_o": float(pi_o),
+            "P_II": float(P_II),
+            "P_IO": float(P_IO),
+            "P_OI": float(P_OI) if np.isfinite(P_OI) else np.nan,
+            "P_OO": float(P_OO) if np.isfinite(P_OO) else np.nan,
+            "P_II + P_IO": sum_I,
+            "P_OI + P_OO": sum_O,
+            "EC_i": float(EC_i),
+            "EV_i": float(EV_i),
+            "EC_o": float(EC_o) if np.isfinite(EC_o) else np.nan,
+            "EV_o": float(EV_o) if np.isfinite(EV_o) else np.nan,
+            "Expected cycle cost": float(EC),
+            "Expected cycle duration": float(EV),
+            "Long-run cost rate": float(EC / EV),
+        }
+
+    def cost_rate(T, tau):
+        if T <= 0 or tau < 0 or tau >= T or T + tau > t[-1]:
+            return np.inf
+        try:
+            return performance(T, tau)["Long-run cost rate"]
+        except Exception:
             return np.inf
 
-        return float(ec_cycle / ev_cycle)
-
-    return cost_rate, ec_i, ev_i, ec_o, ev_o
+    return performance, cost_rate
 
 
 # ============================================================
 # OPTIMIZATION
 # ============================================================
 
-def optimize_policy(
-    cost_rate,
-    settings,
-    progress_container=None,
-):
-    """Run global search followed by local refinement."""
+def optimize_policy(cost_rate, settings, progress_container=None):
+    rows = []
+    counter = 0
+    best = np.inf
 
-    log_rows = []
-    eval_counter = {"Global": 0, "Local": 0}
-
-    best = {
-        "value": np.inf,
-        "T": None,
-        "tau": None,
-        "alpha": None,
-    }
-
-    def add_log(stage: str, T: float, alpha: float, value: float, elapsed: float):
-        tau = alpha * T
-
-        if value < best["value"]:
-            best["value"] = value
-            best["T"] = T
-            best["tau"] = tau
-            best["alpha"] = alpha
-
-        row = {
-            "Stage": stage,
-            "Evaluation": eval_counter[stage],
-            "T": T,
-            "tau": tau,
-            "tau/T": alpha,
-            "Cost-rate": value,
-            "Best cost-rate so far": best["value"],
-            "Evaluation time (s)": elapsed,
-        }
-
-        log_rows.append(row)
-
-        if progress_container is not None:
-            progress_container.dataframe(
-                pd.DataFrame(log_rows).tail(25),
-                use_container_width=True,
-                hide_index=True,
-            )
-
-    def global_objective(x):
-        eval_counter["Global"] += 1
-
+    def objective(x, stage):
+        nonlocal counter, best
         T = float(x[0])
         alpha = float(x[1])
         tau = alpha * T
-
-        start = time.perf_counter()
         value = cost_rate(T, tau)
-        elapsed = time.perf_counter() - start
 
-        add_log("Global", T, alpha, value, elapsed)
+        counter += 1
+        best = min(best, value)
+        rows.append({
+            "Stage": stage,
+            "Evaluation": counter,
+            "T": T,
+            "tau": tau,
+            "tau/T": alpha,
+            "Cost rate": value,
+            "Best cost rate": best,
+        })
+
+        if progress_container is not None and counter % 5 == 0:
+            progress_container.dataframe(
+                pd.DataFrame(rows).tail(25),
+                use_container_width=True,
+                hide_index=True,
+            )
         return value
 
     bounds = [
@@ -556,8 +433,8 @@ def optimize_policy(
         (0.0, settings["alpha_upper"]),
     ]
 
-    result_global = differential_evolution(
-        global_objective,
+    global_result = differential_evolution(
+        lambda x: objective(x, "Global"),
         bounds=bounds,
         seed=123,
         popsize=settings["global_popsize"],
@@ -568,579 +445,365 @@ def optimize_policy(
         workers=1,
     )
 
-    def local_objective(x):
-        eval_counter["Local"] += 1
-
-        T = float(x[0])
-        alpha = float(x[1])
-
-        start = time.perf_counter()
-        value = cost_rate(T, alpha * T)
-        elapsed = time.perf_counter() - start
-
-        add_log("Local", T, alpha, value, elapsed)
-        return value
-
-    result_local = minimize(
-        local_objective,
-        x0=result_global.x,
-        method="Nelder-Mead",
-        options={
-            "xatol": 1e-6,
-            "fatol": 1e-8,
-            "maxiter": settings["local_maxiter"],
-            "disp": False,
-        },
+    local_result = minimize(
+        lambda x: objective(x, "Local"),
+        x0=global_result.x,
+        method="L-BFGS-B",
+        bounds=bounds,
+        options={"maxiter": settings["local_maxiter"], "ftol": 1e-12},
     )
 
-    T_star = float(result_local.x[0])
-    alpha_star = float(result_local.x[1])
+    candidates = [(global_result.fun, global_result.x), (local_result.fun, local_result.x)]
+    best_fun, best_x = min(candidates, key=lambda z: z[0])
+
+    T_star = float(best_x[0])
+    alpha_star = float(best_x[1])
     tau_star = alpha_star * T_star
-    C_star = float(cost_rate(T_star, tau_star))
 
     return {
         "T_star": T_star,
         "tau_star": tau_star,
         "alpha_star": alpha_star,
-        "C_star": C_star,
-        "result_global": result_global,
-        "result_local": result_local,
-        "log": pd.DataFrame(log_rows),
+        "C_star": float(best_fun),
+        "log": pd.DataFrame(rows),
     }
 
 
 # ============================================================
-# USER INTERFACE
+# INTERFACE
 # ============================================================
 
-st.header("General parameters")
+st.header("1. Analysis mode")
+mode = st.radio(
+    "Choose what the software should do",
+    ["Evaluate a specified T and τ", "Optimize T and τ"],
+    captions=[
+        "Enter T and τ and obtain the long-run performance directly.",
+        "Let the software search for the values of T and τ that minimize the long-run cost rate.",
+    ],
+)
 
-col1, col2, col3, col4 = st.columns(4)
+st.divider()
+st.header("2. General parameters")
+st.markdown(
+    """
+Use the same time unit for all reliability and policy parameters and the same
+monetary unit for all costs.
 
-with col1:
-    ci = st.number_input(
-        "Scheduled intervention cost (Ci)",
-        min_value=0.0,
-        value=500.0,
-        step=50.0,
-        help="Fixed cost associated with a scheduled inspection/intervention.",
-    )
+**Ci** is the fixed cost of a scheduled inspection/intervention.  
+**Co** is the fixed cost of an opportunistic inspection/intervention.  
+**Cf** is the base corrective cost associated with every system failure.  
+**μ** is the arrival rate of external opportunities. Opportunities are assumed
+to follow a homogeneous Poisson process, so the waiting time between successive
+opportunities is exponentially distributed with mean **1/μ**.
+"""
+)
 
-with col2:
-    co = st.number_input(
-        "Opportunistic intervention cost (Co)",
-        min_value=0.0,
-        value=300.0,
-        step=50.0,
-        help="Fixed cost associated with an opportunistic inspection/intervention.",
-    )
-
-with col3:
-    cf = st.number_input(
-        "Base corrective failure cost (Cf)",
-        min_value=0.0,
-        value=1500.0,
-        step=100.0,
-        help="General system-level cost caused by a failure event.",
-    )
-
-with col4:
+c1, c2, c3, c4 = st.columns(4)
+with c1:
+    ci = st.number_input("Scheduled intervention cost (Ci)", min_value=0.0, value=None, placeholder="Enter Ci")
+with c2:
+    co = st.number_input("Opportunistic intervention cost (Co)", min_value=0.0, value=None, placeholder="Enter Co")
+with c3:
+    cf = st.number_input("Base failure cost (Cf)", min_value=0.0, value=None, placeholder="Enter Cf")
+with c4:
     mu = st.number_input(
-        "Opportunity arrival rate (μ)",
-        min_value=1e-8,
-        value=0.001,
-        step=0.0001,
-        format="%.6f",
-        help="Rate of the Homogeneous Poisson Process that generates opportunities.",
+        "Opportunity arrival rate (μ)", min_value=0.0, value=None,
+        placeholder="Enter μ", format="%.8f",
+        help="Rate of the homogeneous Poisson process that generates external opportunities."
     )
 
 st.divider()
+st.header("3. Component structure and delay-time parameters")
+st.markdown(
+    """
+For component type **j**:
 
-st.header("Component structure")
+- **Quantity qj**: number of identical components of that type in the series system.
+- **E[Xj]**: mean time from renewal/replacement until a detectable defect arrives. The time to defect **Xj** is exponentially distributed. The model internally uses `λj = 1/E[Xj]`, so `Xj ~ Exponential(λj)`.
+- **βj**: Weibull shape parameter for **Hj**, the delay time between defect arrival and functional failure.
+- **ηj**: Weibull scale parameter for **Hj**. Thus `Hj ~ Weibull(βj, ηj)`.
+- The total failure time is **Zj = Xj + Hj**.
+- **CEFj**: additional failure consequence cost when the system failure is caused by component type j. The total cost of such a failure is `Cf + CEFj`.
+"""
+)
 
 n_types = st.number_input(
     "Number of distinct component types",
     min_value=1,
     max_value=20,
-    value=4,
+    value=None,
     step=1,
-    help=(
-        "Use component types to avoid repeated data entry. "
-        "For example, if the system has 5 identical bearings, enter one component type "
-        "with quantity equal to 5."
-    ),
+    placeholder="Enter number of component types",
 )
 
-quantities = []
-lambda_x = []
-beta_h = []
-eta_h = []
-cef = []
+quantities, mean_x_input, beta_h, eta_h, cef = [], [], [], [], []
 
-default_lambda = [0.0015, 0.0010, 0.0007, 0.0005]
-default_beta = [2.0, 2.5, 3.0, 2.2]
-default_eta = [180.0, 250.0, 350.0, 450.0]
-default_cef = [500.0, 800.0, 1000.0, 1200.0]
+if n_types is not None:
+    for i in range(int(n_types)):
+        with st.expander(f"Component type {i+1}", expanded=True):
+            a, b, c, d, e = st.columns(5)
+            with a:
+                q = st.number_input(
+                    f"Quantity q{i+1}", min_value=1, value=None, step=1,
+                    placeholder="q", key=f"q_{i}"
+                )
+            with b:
+                mean_x = st.number_input(
+                    f"Mean time to defect E[X{i+1}]", min_value=0.0,
+                    value=None, placeholder="Mean X", format="%.6f", key=f"mean_x_{i}",
+                    help=(f"Mean time until defect arrival for component type {i+1}. "
+                          f"X{i+1} is exponentially distributed and the model uses "
+                          f"λ{i+1} = 1 / E[X{i+1}].")
+                )
+            with c:
+                beta = st.number_input(
+                    f"Weibull shape β{i+1} for H{i+1}", min_value=0.0,
+                    value=None, placeholder="β", format="%.6f", key=f"beta_{i}",
+                    help=f"H{i+1} is the delay time from defect arrival to failure."
+                )
+            with d:
+                eta = st.number_input(
+                    f"Weibull scale η{i+1} for H{i+1}", min_value=0.0,
+                    value=None, placeholder="η", format="%.6f", key=f"eta_{i}"
+                )
+            with e:
+                ce = st.number_input(
+                    f"Extra failure cost CEF{i+1}", min_value=0.0,
+                    value=None, placeholder="CEF", key=f"cef_{i}"
+                )
 
-st.markdown("### Reliability and cost parameters by component type")
-
-for i in range(int(n_types)):
-    with st.expander(f"Component type {i + 1}", expanded=True):
-        c1, c2, c3, c4, c5 = st.columns(5)
-
-        with c1:
-            q = st.number_input(
-                f"Quantity of type {i + 1}",
-                min_value=1,
-                value=1,
-                step=1,
-                key=f"quantity_{i}",
-                help="Number of identical components represented by this type.",
-            )
-
-        with c2:
-            lam = st.number_input(
-                f"λ for X, type {i + 1}",
-                min_value=1e-8,
-                value=default_lambda[i] if i < len(default_lambda) else 0.001,
-                step=0.0001,
-                format="%.6f",
-                key=f"lambda_{i}",
-                help="Rate of the exponential time-to-defect distribution.",
-            )
-
-        with c3:
-            beta = st.number_input(
-                f"Weibull β, type {i + 1}",
-                min_value=0.1,
-                value=default_beta[i] if i < len(default_beta) else 2.0,
-                step=0.1,
-                format="%.4f",
-                key=f"beta_{i}",
-                help="Shape parameter of the Weibull delay-time distribution.",
-            )
-
-        with c4:
-            eta = st.number_input(
-                f"Weibull η, type {i + 1}",
-                min_value=1e-8,
-                value=default_eta[i] if i < len(default_eta) else 250.0,
-                step=10.0,
-                format="%.4f",
-                key=f"eta_{i}",
-                help="Scale parameter of the Weibull delay-time distribution.",
-            )
-
-        with c5:
-            c_extra = st.number_input(
-                f"Extra failure cost, type {i + 1}",
-                min_value=0.0,
-                value=default_cef[i] if i < len(default_cef) else 500.0,
-                step=100.0,
-                format="%.4f",
-                key=f"cef_{i}",
-                help="Additional cost associated with a failure caused by this component type.",
-            )
-
-        quantities.append(q)
-        lambda_x.append(lam)
-        beta_h.append(beta)
-        eta_h.append(eta)
-        cef.append(c_extra)
-
-input_df = pd.DataFrame(
-    {
-        "Component type": [f"Type {i + 1}" for i in range(int(n_types))],
-        "Quantity": quantities,
-        "lambda_X": lambda_x,
-        "beta_H": beta_h,
-        "eta_H": eta_h,
-        "Extra failure cost": cef,
-    }
-)
-
-st.markdown("### Input summary")
-st.dataframe(input_df, use_container_width=True, hide_index=True)
+            quantities.append(q)
+            mean_x_input.append(mean_x)
+            beta_h.append(beta)
+            eta_h.append(eta)
+            cef.append(ce)
 
 st.divider()
+st.header("4. Policy variables")
 
-st.info(
-    "Numerical and optimization settings are selected automatically from the input data. "
-    "This keeps the interface simple while adapting the grid and search range to the reliability scale."
-)
+T_user = tau_user = None
+if mode == "Evaluate a specified T and τ":
+    p1, p2 = st.columns(2)
+    with p1:
+        T_user = st.number_input(
+            "Scheduled inspection interval (T)", min_value=0.0, value=None,
+            placeholder="Enter T"
+        )
+    with p2:
+        tau_user = st.number_input(
+            "Opportunistic inspection window (τ)", min_value=0.0, value=None,
+            placeholder="Enter τ", help="The policy requires 0 ≤ τ < T."
+        )
+else:
+    st.info(
+        "T and τ are decision variables. The software searches globally and then "
+        "performs a bounded local refinement. The constraint 0 ≤ τ < T is handled "
+        "through α = τ/T."
+    )
 
-run_button = st.button("Run optimization", type="primary")
+run_label = "Evaluate policy" if mode == "Evaluate a specified T and τ" else "Optimize policy"
+run = st.button(run_label, type="primary")
 
 
 # ============================================================
-# MODEL EXECUTION
+# EXECUTION
 # ============================================================
 
-if run_button:
-    total_start = time.perf_counter()
+if run:
+    errors = []
 
-    quantities = np.asarray(quantities, dtype=float)
-    lambda_x = np.asarray(lambda_x, dtype=float)
-    beta_h = np.asarray(beta_h, dtype=float)
-    eta_h = np.asarray(eta_h, dtype=float)
-    cef = np.asarray(cef, dtype=float)
+    if any(v is None for v in [ci, co, cf, mu]):
+        errors.append("Complete all general parameters.")
+    elif mu <= 0:
+        errors.append("μ must be greater than zero.")
+
+    if n_types is None:
+        errors.append("Enter the number of component types.")
+    else:
+        all_component_values = quantities + mean_x_input + beta_h + eta_h + cef
+        if any(v is None for v in all_component_values):
+            errors.append("Complete all component parameters.")
+        else:
+            if any(v <= 0 for v in mean_x_input):
+                errors.append("Every mean time to defect E[Xj] must be greater than zero.")
+            if any(v <= 0 for v in beta_h):
+                errors.append("Every Weibull shape βj must be greater than zero.")
+            if any(v <= 0 for v in eta_h):
+                errors.append("Every Weibull scale ηj must be greater than zero.")
+
+    if mode == "Evaluate a specified T and τ":
+        if T_user is None or tau_user is None:
+            errors.append("Enter both T and τ.")
+        elif T_user <= 0:
+            errors.append("T must be greater than zero.")
+        elif tau_user >= T_user:
+            errors.append("τ must be smaller than T.")
+
+    if errors:
+        for err in errors:
+            st.error(err)
+        st.stop()
+
+    quantities_np = np.asarray(quantities, dtype=float)
+    mean_x_np = np.asarray(mean_x_input, dtype=float)
+    lambda_np = 1.0 / mean_x_np
+    beta_np = np.asarray(beta_h, dtype=float)
+    eta_np = np.asarray(eta_h, dtype=float)
+    cef_np = np.asarray(cef, dtype=float)
+
+    required_horizon = None
+    if mode == "Evaluate a specified T and τ":
+        required_horizon = float(T_user + tau_user)
 
     settings = automatic_settings(
-        quantities=quantities,
-        lambda_x=lambda_x,
-        beta_h=beta_h,
-        eta_h=eta_h,
+        quantities_np, lambda_np, beta_np, eta_np,
+        required_horizon=required_horizon,
     )
 
-    t_max = settings["t_max"]
-
-    st.subheader("Automatic numerical settings")
-
-    settings_df = pd.DataFrame(
-        [
-            {"Setting": "Characteristic system scale", "Value": settings["system_scale"]},
-            {"Setting": "Total number of components", "Value": settings["total_components"]},
-            {"Setting": "Lower bound for T", "Value": settings["T_lower"]},
-            {"Setting": "Upper bound for T", "Value": settings["T_upper"]},
-            {"Setting": "Grid horizon", "Value": settings["t_max"]},
-            {"Setting": "Time step dt", "Value": settings["dt"]},
-            {"Setting": "Quadrature points", "Value": settings["n_quad"]},
-            {"Setting": "Global search iterations", "Value": settings["global_maxiter"]},
-            {"Setting": "Global population size", "Value": settings["global_popsize"]},
-        ]
-    )
-
-    st.dataframe(settings_df, use_container_width=True, hide_index=True)
-
-    st.subheader("Model construction")
-
-    model_status = st.status(
-        "Building reliability and renewal curves...",
-        expanded=True,
-    )
-
-    with model_status:
-        st.write("Computing component failure distributions.")
-        st.write("Computing system first-failure density.")
-        st.write("Computing renewal-based expected failures by component type.")
-
-        t, mj_grid, info = build_model(
-            quantities=quantities,
-            lambda_x=lambda_x,
-            beta_h=beta_h,
-            eta_h=eta_h,
-            dt=settings["dt"],
-            t_max=t_max,
-            max_renewal_terms=settings["max_renewal_terms"],
-            renewal_tol=settings["renewal_tol"],
+    with st.status("Building reliability and renewal model...", expanded=False) as status:
+        t, M_j, info = build_model(
+            quantities_np, lambda_np, beta_np, eta_np,
+            settings["dt"], settings["t_max"],
+            settings["max_renewal_terms"], settings["renewal_tol"],
         )
+        status.update(label="Reliability and renewal model completed.", state="complete")
 
-        st.write("Model construction completed.")
-
-    model_status.update(
-        label="Reliability and renewal curves built successfully.",
-        state="complete",
-        expanded=False,
+    performance, cost_rate = make_cost_functions(
+        t, M_j, cef_np, float(ci), float(co), float(cf), float(mu), settings["n_quad"]
     )
 
-    col_a, col_b, col_c, col_d = st.columns(4)
+    with st.expander("Numerical checks", expanded=False):
+        check_df = pd.DataFrame({
+            "Component type": [f"Type {i+1}" for i in range(int(n_types))],
+            "Integral of f_Z over numerical grid": info["component_masses"],
+        })
+        st.dataframe(check_df, use_container_width=True, hide_index=True)
+        st.write(f"System first-failure density mass over grid: {info['system_first_failure_mass']:.8f}")
+        st.write(f"Numerical grid: {info['n_grid']} points; dt = {info['dt']:.6g}; horizon = {info['t_max']:.6g}")
+        st.write(f"Renewal summation stopped at convolution order: {info['renewal_stop_term']}")
 
-    col_a.metric("Grid points", f"{info['n_grid']}")
-    col_b.metric("Build time", f"{info['build_time']:.2f} s")
-    col_c.metric("Renewal stop term", f"{info['renewal_stop_term']}")
-    col_d.metric("System first-failure mass", f"{info['system_first_failure_mass']:.6f}")
+    def show_probability_check(result, tolerance=1e-4):
+        st.markdown("#### Transition-probability consistency check")
 
-    mass_df = pd.DataFrame(
-        {
-            "Component type": [f"Type {i + 1}" for i in range(int(n_types))],
-            "Integral of f_Z over grid": info["component_masses"],
-        }
-    )
+        sum_I = result["P_II + P_IO"]
+        sum_O = result["P_OI + P_OO"]
 
-    st.markdown("#### Probability mass checks")
-    st.dataframe(mass_df, use_container_width=True, hide_index=True)
+        probability_df = pd.DataFrame({
+            "Transition": ["P_II", "P_IO", "P_OI", "P_OO"],
+            "Probability": [
+                result["P_II"], result["P_IO"],
+                result["P_OI"], result["P_OO"],
+            ],
+        })
+        st.dataframe(probability_df, use_container_width=True, hide_index=True)
 
-    with st.expander("Renewal calculation log", expanded=False):
-        for msg in info["progress_messages"]:
-            st.text(msg)
+        c1, c2 = st.columns(2)
+        c1.metric("P_II + P_IO", f"{sum_I:.10f}")
+        if np.isfinite(sum_O):
+            c2.metric("P_OI + P_OO", f"{sum_O:.10f}")
+        else:
+            c2.metric("P_OI + P_OO", "N/A")
 
-    cost_rate, ec_i, ev_i, ec_o, ev_o = make_cost_functions(
-        t=t,
-        mj_grid=mj_grid,
-        cef=cef,
-        ci=float(ci),
-        co=float(co),
-        cf=float(cf),
-        mu=float(mu),
-        n_quad=settings["n_quad"],
-    )
+        error_I = abs(sum_I - 1.0)
+        ok_I = error_I <= tolerance
+        ok_O = np.isfinite(sum_O) and abs(sum_O - 1.0) <= tolerance
 
-    st.subheader("Optimization progress")
-    st.info("The table below updates while the optimizer tests candidate solutions.")
-    progress_container = st.empty()
+        if result["tau"] <= 0.0:
+            if ok_I:
+                st.success(
+                    f"Probability check OK for state I: P_II + P_IO = {sum_I:.10f}. "
+                    "State O is unreachable when τ = 0, so the O-row check is not applicable."
+                )
+            else:
+                st.warning(
+                    f"Probability check warning: P_II + P_IO = {sum_I:.10f} "
+                    f"(error = {error_I:.3e})."
+                )
+        elif ok_I and ok_O:
+            st.success(
+                "Probability check OK: both transition rows sum to 1 within "
+                f"the numerical tolerance ({tolerance:g})."
+            )
+        else:
+            errors = [f"I-row error = {error_I:.3e}"]
+            if np.isfinite(sum_O):
+                errors.append(f"O-row error = {abs(sum_O - 1.0):.3e}")
+            st.warning(
+                "Transition probabilities do not close sufficiently close to 1. "
+                + "; ".join(errors)
+                + ". Consider increasing the quadrature resolution."
+            )
 
-    opt_status = st.status(
-        "Running optimization...",
-        expanded=True,
-    )
+    if mode == "Evaluate a specified T and τ":
+        result = performance(float(T_user), float(tau_user))
 
-    with opt_status:
-        st.write("Running global search.")
-        st.write("Running local refinement after the global search.")
+        st.subheader("Policy performance")
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("T", f"{result['T']:.6f}")
+        m2.metric("τ", f"{result['tau']:.6f}")
+        m3.metric("τ/T", f"{result['tau/T']:.6f}")
+        m4.metric("Long-run cost rate", f"{result['Long-run cost rate']:.8f}")
 
-        results = optimize_policy(
-            cost_rate=cost_rate,
-            settings=settings,
-            progress_container=progress_container,
-        )
-
-        st.write("Optimization completed.")
-
-    opt_status.update(
-        label="Optimization completed successfully.",
-        state="complete",
-        expanded=False,
-    )
-
-    T_star = results["T_star"]
-    tau_star = results["tau_star"]
-    alpha_star = results["alpha_star"]
-    C_star = results["C_star"]
-
-    st.subheader("Optimal policy")
-
-    m1, m2, m3, m4 = st.columns(4)
-
-    m1.metric("Optimal T*", f"{T_star:.6f}")
-    m2.metric("Optimal τ*", f"{tau_star:.6f}")
-    m3.metric("τ*/T*", f"{alpha_star:.6f}")
-    m4.metric("Cost-rate C∞", f"{C_star:.8f}")
-
-    st.markdown("#### Cycle quantities")
-
-    pi_i = prob_no_opportunity(tau_star, float(mu))
-    pi_o = 1.0 - pi_i
-
-    cycle_df = pd.DataFrame(
-        {
-            "Quantity": [
-                "EC_i",
-                "EV_i",
-                "EC_o",
-                "EV_o",
-                "pi_i",
-                "pi_o",
+        details = pd.DataFrame({
+            "Measure": [
+                "Probability of scheduled-state cycle (πi)",
+                "Probability of opportunistic-state cycle (πo)",
+                "Expected cost from scheduled state (ECi)",
+                "Expected duration from scheduled state (EVi)",
+                "Expected cost from opportunistic state (ECo)",
+                "Expected duration from opportunistic state (EVo)",
+                "Overall expected cycle cost",
+                "Overall expected cycle duration",
+                "Long-run expected cost rate",
             ],
             "Value": [
-                ec_i(T_star, tau_star),
-                ev_i(T_star, tau_star),
-                ec_o(T_star, tau_star),
-                ev_o(T_star, tau_star),
-                pi_i,
-                pi_o,
-            ],
-        }
-    )
+                result["pi_i"], result["pi_o"], result["EC_i"], result["EV_i"],
+                result["EC_o"], result["EV_o"], result["Expected cycle cost"],
+                result["Expected cycle duration"], result["Long-run cost rate"],
+            ]
+        })
+        st.dataframe(details, use_container_width=True, hide_index=True)
+        show_probability_check(result)
 
-    st.dataframe(cycle_df, use_container_width=True, hide_index=True)
-
-    st.markdown("#### Tested solutions")
-    st.dataframe(results["log"], use_container_width=True, hide_index=True)
-
-    csv_log = results["log"].to_csv(index=False).encode("utf-8")
-
-    st.download_button(
-        "Download tested solutions as CSV",
-        data=csv_log,
-        file_name="optimization_tested_solutions.csv",
-        mime="text/csv",
-    )
-
-    # Periodic policy comparison
-    st.subheader("Periodic policy comparison")
-
-    def periodic_objective(x):
-        return cost_rate(float(x[0]), 0.0)
-
-    periodic_status = st.status(
-        "Optimizing periodic policy...",
-        expanded=False,
-    )
-
-    with periodic_status:
-        result_periodic = minimize(
-            periodic_objective,
-            x0=np.array([T_star]),
-            bounds=[(settings["T_lower"], settings["T_upper"])],
-            method="L-BFGS-B",
-        )
-
-    periodic_status.update(
-        label="Periodic policy optimization completed.",
-        state="complete",
-        expanded=False,
-    )
-
-    T_periodic = float(result_periodic.x[0])
-    C_periodic = float(result_periodic.fun)
-    improvement = 100.0 * (C_periodic - C_star) / C_periodic
-
-    p1, p2, p3 = st.columns(3)
-
-    p1.metric("Periodic T", f"{T_periodic:.6f}")
-    p2.metric("Periodic cost-rate", f"{C_periodic:.8f}")
-    p3.metric("Improvement over periodic", f"{improvement:.4f}%")
-
-    # Numerical validation
-    st.subheader("Numerical validation")
-
-    validation_status = st.status(
-        "Running numerical validation...",
-        expanded=False,
-    )
-
-    validation_rows = []
-
-    with validation_status:
-        st.write("Checking sensitivity to quadrature points.")
-
-        for nq in [50, 100, 150, 200]:
-            cr_tmp, _, _, _, _ = make_cost_functions(
-                t=t,
-                mj_grid=mj_grid,
-                cef=cef,
-                ci=float(ci),
-                co=float(co),
-                cf=float(cf),
-                mu=float(mu),
-                n_quad=int(nq),
-            )
-
-            C_test = cr_tmp(T_star, tau_star)
-
-            validation_rows.append(
-                {
-                    "Test": "n_quad sensitivity",
-                    "Setting": f"n_quad = {nq}",
-                    "Cost-rate": C_test,
-                    "Difference from base": C_test - C_star,
-                }
-            )
-
-        st.write("Checking sensitivity to the time step.")
-
-        for dt_test in [0.5, 0.25, 0.1]:
-            t_test, mj_test, info_test = build_model(
-                quantities=quantities,
-                lambda_x=lambda_x,
-                beta_h=beta_h,
-                eta_h=eta_h,
-                dt=float(dt_test),
-                t_max=t_max,
-                max_renewal_terms=settings["max_renewal_terms"],
-                renewal_tol=settings["renewal_tol"],
-            )
-
-            cr_test, _, _, _, _ = make_cost_functions(
-                t=t_test,
-                mj_grid=mj_test,
-                cef=cef,
-                ci=float(ci),
-                co=float(co),
-                cf=float(cf),
-                mu=float(mu),
-                n_quad=settings["n_quad"],
-            )
-
-            C_test = cr_test(T_star, tau_star)
-
-            validation_rows.append(
-                {
-                    "Test": "dt sensitivity",
-                    "Setting": f"dt = {dt_test}",
-                    "Cost-rate": C_test,
-                    "Difference from base": C_test - C_star,
-                }
-            )
-
-        st.write("Checking local stability around the optimum.")
-
-        perturbations = [
-            (-0.02, 0.00),
-            (0.02, 0.00),
-            (0.00, -0.02),
-            (0.00, 0.02),
-            (-0.02, -0.02),
-            (0.02, 0.02),
-        ]
-
-        for dT_rel, dtau_rel in perturbations:
-            T_test = T_star * (1.0 + dT_rel)
-            tau_test = tau_star * (1.0 + dtau_rel)
-
-            if tau_test >= T_test:
-                continue
-
-            C_test = cost_rate(T_test, tau_test)
-
-            validation_rows.append(
-                {
-                    "Test": "local stability",
-                    "Setting": f"T {dT_rel:+.0%}, tau {dtau_rel:+.0%}",
-                    "Cost-rate": C_test,
-                    "Difference from base": C_test - C_star,
-                }
-            )
-
-    validation_status.update(
-        label="Numerical validation completed.",
-        state="complete",
-        expanded=False,
-    )
-
-    validation_df = pd.DataFrame(validation_rows)
-    st.dataframe(validation_df, use_container_width=True, hide_index=True)
-
-    # Reference point check
-    st.subheader("Reference point check")
-
-    ref_col1, ref_col2, ref_col3 = st.columns(3)
-
-    with ref_col1:
-        T_ref = st.number_input(
-            "Reference T",
-            min_value=0.0,
-            value=230.20,
-            step=1.0,
-            format="%.4f",
-        )
-
-    with ref_col2:
-        tau_ref = st.number_input(
-            "Reference tau",
-            min_value=0.0,
-            value=118.99,
-            step=1.0,
-            format="%.4f",
-        )
-
-    with ref_col3:
-        C_ref = st.number_input(
-            "Reference cost-rate",
-            min_value=0.0,
-            value=3.6337,
-            step=0.01,
-            format="%.6f",
-        )
-
-    if tau_ref < T_ref:
-        C_at_ref = cost_rate(float(T_ref), float(tau_ref))
-
-        r1, r2 = st.columns(2)
-        r1.metric("Model cost-rate at reference point", f"{C_at_ref:.8f}")
-        r2.metric("Difference from reference", f"{C_at_ref - C_ref:+.8f}")
     else:
-        st.warning("Reference tau must be smaller than reference T.")
+        st.subheader("Optimization progress")
+        progress = st.empty()
 
-    total_elapsed = time.perf_counter() - total_start
-    st.success(f"Run completed in {total_elapsed:.2f} seconds.")
+        with st.status("Optimizing T and τ...", expanded=False) as status:
+            opt = optimize_policy(cost_rate, settings, progress)
+            status.update(label="Optimization completed.", state="complete")
+
+        result = performance(opt["T_star"], opt["tau_star"])
+
+        st.subheader("Optimal policy")
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Optimal T*", f"{opt['T_star']:.6f}")
+        m2.metric("Optimal τ*", f"{opt['tau_star']:.6f}")
+        m3.metric("τ*/T*", f"{opt['alpha_star']:.6f}")
+        m4.metric("Minimum cost rate", f"{opt['C_star']:.8f}")
+
+        st.markdown("#### Performance at the optimum")
+        details = pd.DataFrame({
+            "Measure": [
+                "πi", "πo", "ECi", "EVi", "ECo", "EVo",
+                "Overall expected cycle cost", "Overall expected cycle duration",
+                "Long-run expected cost rate",
+            ],
+            "Value": [
+                result["pi_i"], result["pi_o"], result["EC_i"], result["EV_i"],
+                result["EC_o"], result["EV_o"], result["Expected cycle cost"],
+                result["Expected cycle duration"], result["Long-run cost rate"],
+            ]
+        })
+        st.dataframe(details, use_container_width=True, hide_index=True)
+        show_probability_check(result)
+
+        with st.expander("Tested solutions", expanded=False):
+            st.dataframe(opt["log"], use_container_width=True, hide_index=True)
+            st.download_button(
+                "Download tested solutions as CSV",
+                data=opt["log"].to_csv(index=False).encode("utf-8"),
+                file_name="T_tau_optimization_log.csv",
+                mime="text/csv",
+            )
