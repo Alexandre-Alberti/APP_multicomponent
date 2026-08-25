@@ -94,13 +94,13 @@ def automatic_settings(quantities, lambda_x, beta_h, eta_h, required_horizon=Non
         t_max = max(t_max, 1.20 * float(required_horizon))
         T_upper = max(T_upper, min(float(required_horizon), 10000.0))
 
-    dt = float(np.clip(system_scale / 2000.0, 0.01, 0.5))
+    dt = float(np.clip(system_scale / 5000.0, 0.005, 0.2))
     max_grid_points = 50000
     if t_max / dt > max_grid_points:
         dt = t_max / max_grid_points
 
     ncomp = int(np.sum(quantities))
-    n_quad = 500
+    n_quad = 300
     n_types = len(quantities)
 
     return {
