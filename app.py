@@ -614,7 +614,7 @@ else:
         "through α = τ/T."
     )
 
-run_label = "Evaluate policy" if mode == "Evaluate a specified T and τ" else "Optimize policy"
+run_label = "Evaluate policy" if mode == "Evaluate pre-specified T and τ" else "Optimize policy"
 run = st.button(run_label, type="primary")
 
 
