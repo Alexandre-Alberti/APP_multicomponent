@@ -288,7 +288,7 @@ def make_cost_functions(t, M_j_grid, cef, ci, co, cf, mu, n_quad):
             )
         cost_oo = integrate_y(np.trapezoid(matrix, y, axis=1), w)
 
-        return float((cost_oi + cost_oo)/pi_o)
+        return float((cost_oi + cost_oo))
 
     def ev_o(T, tau):
         if tau <= 0.0:
@@ -308,7 +308,7 @@ def make_cost_functions(t, M_j_grid, cef, ci, co, cf, mu, n_quad):
             matrix[i, :] = fw[i] * fy * (T + y - wi)
         dur_oo = integrate_y(np.trapezoid(matrix, y, axis=1), w)
 
-        return float((dur_oi + dur_oo)/pi_o)
+        return float((dur_oi + dur_oo))
 
     def performance(T, tau):
         if T <= 0:
