@@ -100,7 +100,7 @@ def automatic_settings(quantities, lambda_x, beta_h, eta_h, required_horizon=Non
         dt = t_max / max_grid_points
 
     ncomp = int(np.sum(quantities))
-    n_quad = 200
+    n_quad = 500
     n_types = len(quantities)
 
     return {
