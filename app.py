@@ -665,7 +665,7 @@ if run:
     cef_np = np.asarray(cef, dtype=float)
 
     required_horizon = None
-    if mode == "Evaluate a specified T and τ":
+    if mode == "Evaluate pre-specified T and τ":
         required_horizon = float(T_user + tau_user)
 
     settings = automatic_settings(
