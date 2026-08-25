@@ -775,7 +775,7 @@ if run:
                 f"convolution order {info['renewal_stop_term']}."
             )
 
-    if mode == "Evaluate a specified T and τ":
+    if mode == "Evaluate pre-specified T and τ":
         result = performance(float(T_user), float(tau_user))
 
         st.subheader("Policy performance")
