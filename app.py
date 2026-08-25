@@ -12,13 +12,14 @@ from scipy.special import gamma
 # PAGE
 # ============================================================
 
-st.set_page_config(page_title="T–τ Opportunistic Inspection Policy", layout="wide")
-st.title("T–τ Opportunistic Inspection Policy")
+st.set_page_config(page_title="Quasi-Periodic Opportunistic Inspection and Maintenance Policy - Evaluation and Optimization", layout="wide")
+st.title("T-τ Policy - Evaluation and Optimization")
 st.caption(
-    "Evaluation and optimization of a quasi-periodic opportunistic inspection "
-    "policy for a multi-component series system under the delay-time framework."
+    "Evaluation and optimization of a quasi-periodic opportunistic inspection and maintenance "
+    "policy for a multi-component system under the delay-time framework."
 )
 
+# Tolerances
 GLOBAL_TOL = 1e-5
 RENEWAL_TOL = 1e-10
 ALPHA_UPPER = 0.999
@@ -71,7 +72,7 @@ def automatic_settings(quantities, lambda_x, beta_h, eta_h, required_horizon=Non
     system_scale = float(np.min(mean_z) / max(total_components ** 0.35, 1.0))
 
     T_lower = max(1e-3, 0.02 * system_scale)
-    T_upper = min(max(50.0, 4.0 * system_scale), 10000.0)
+    T_upper = max(50.0, 6.0 * system_scale)
 
     # Tail-based horizon. Using only multiples of the mean can truncate a
     # non-negligible part of Z = X + H, especially for long-tailed Weibull H.
@@ -99,7 +100,7 @@ def automatic_settings(quantities, lambda_x, beta_h, eta_h, required_horizon=Non
         dt = t_max / max_grid_points
 
     ncomp = int(np.sum(quantities))
-    n_quad = 140 if ncomp < 8 else 110 if ncomp < 15 else 80
+    n_quad = 200
     n_types = len(quantities)
 
     return {
@@ -288,7 +289,7 @@ def make_cost_functions(t, M_j_grid, cef, ci, co, cf, mu, n_quad):
             )
         cost_oo = integrate_y(np.trapezoid(matrix, y, axis=1), w)
 
-        return float((cost_oi + cost_oo))
+        return float((cost_oi + cost_oo)/pi_o)
 
     def ev_o(T, tau):
         if tau <= 0.0:
@@ -308,7 +309,7 @@ def make_cost_functions(t, M_j_grid, cef, ci, co, cf, mu, n_quad):
             matrix[i, :] = fw[i] * fy * (T + y - wi)
         dur_oo = integrate_y(np.trapezoid(matrix, y, axis=1), w)
 
-        return float((dur_oi + dur_oo))
+        return float((dur_oi + dur_oo)/pi_o)
 
     def performance(T, tau):
         if T <= 0:
@@ -487,11 +488,11 @@ def optimize_policy(cost_rate, settings, progress_container=None):
 
 st.header("1. Analysis mode")
 mode = st.radio(
-    "Choose what the software should do",
-    ["Evaluate a specified T and τ", "Optimize T and τ"],
+    "Choose what the software should do:",
+    ["Evaluate pre-specified T and τ", "Optimize T and τ"],
     captions=[
         "Enter T and τ and obtain the long-run performance directly.",
-        "Let the software search for the values of T and τ that minimize the long-run cost rate.",
+        "Let the software search for the values of T and τ that minimize the long-run cost-rate.",
     ],
 )
 
@@ -502,48 +503,47 @@ st.markdown(
 Use the same time unit for all reliability and policy parameters and the same
 monetary unit for all costs.
 
-**Ci** is the fixed cost of a scheduled inspection/intervention.  
-**Co** is the fixed cost of an opportunistic inspection/intervention.  
-**Cf** is the base corrective cost associated with every system failure.  
-**μ** is the arrival rate of external opportunities. Opportunities are assumed
-to follow a homogeneous Poisson process, so the waiting time between successive
-opportunities is exponentially distributed with mean **1/μ**.
+**Ci** - fixed cost of a scheduled inspection/intervention  
+**Co** - fixed cost of an opportunistic inspection/intervention  
+**Cf** - base cost of a corrective intervention  
+**μ** - rate of opportunities arrival 
+(opportunities are assumed to follow a homogeneous Poisson process)
 """
 )
 
 c1, c2, c3, c4 = st.columns(4)
 with c1:
-    ci = st.number_input("Scheduled intervention cost (Ci)", min_value=0.0, value=None, placeholder="Enter Ci")
+    ci = st.number_input("Ci", min_value=0.0, value=None, placeholder="Enter Ci")
 with c2:
-    co = st.number_input("Opportunistic intervention cost (Co)", min_value=0.0, value=None, placeholder="Enter Co")
+    co = st.number_input("Co", min_value=0.0, value=None, placeholder="Enter Co")
 with c3:
-    cf = st.number_input("Base failure cost (Cf)", min_value=0.0, value=None, placeholder="Enter Cf")
+    cf = st.number_input("Cf", min_value=0.0, value=None, placeholder="Enter Cf")
 with c4:
     mu = st.number_input(
-        "Opportunity arrival rate (μ)", min_value=0.0, value=None,
+        "μ", min_value=0.0, value=None,
         placeholder="Enter μ", format="%.8f",
         help="Rate of the homogeneous Poisson process that generates external opportunities."
     )
 
 st.divider()
-st.header("3. Component structure and delay-time parameters")
+st.header("3. Components delay-time parameters")
 st.markdown(
     """
 For component type **j**:
 
-- **Quantity qj**: number of identical components of that type in the series system.
-- **E[Xj]**: mean time from renewal/replacement until a detectable defect arrives. The time to defect **Xj** is exponentially distributed. The model internally uses `λj = 1/E[Xj]`, so `Xj ~ Exponential(λj)`.
-- **βj**: Weibull shape parameter for **Hj**, the delay time between defect arrival and functional failure.
-- **ηj**: Weibull scale parameter for **Hj**. Thus `Hj ~ Weibull(βj, ηj)`.
-- The total failure time is **Zj = Xj + Hj**.
-- **CEFj**: additional failure consequence cost when the system failure is caused by component type j. The total cost of such a failure is `Cf + CEFj`.
+- **Quantity qj** - number of components of type j in the series-arranjed system
+- **E[Xj]** - mean time to defect arrival (the time to defect **Xj** is exponentially distributed)
+- **βj** - Weibull shape parameter for **Hj**, the delay time between defect arrival and failure
+- **ηj** - Weibull scale parameter for **Hj**
+- **Cef_j** - additional cost when the system failure is caused by a component type j
+(the total cost of such a failure is `Cf + Cef_j`)
 """
 )
 
 n_types = st.number_input(
-    "Number of distinct component types",
+    "Number of distinct component types (max 50)",
     min_value=1,
-    max_value=20,
+    max_value=50,
     value=None,
     step=1,
     placeholder="Enter number of component types",
@@ -557,12 +557,12 @@ if n_types is not None:
             a, b, c, d, e = st.columns(5)
             with a:
                 q = st.number_input(
-                    f"Quantity q{i+1}", min_value=1, value=None, step=1,
+                    f"q{i+1}", min_value=1, value=None, step=1,
                     placeholder="q", key=f"q_{i}"
                 )
             with b:
                 mean_x = st.number_input(
-                    f"Mean time to defect E[X{i+1}]", min_value=0.0,
+                    f"E[X{i+1}]", min_value=0.0,
                     value=None, placeholder="Mean X", format="%.6f", key=f"mean_x_{i}",
                     help=(f"Mean time until defect arrival for component type {i+1}. "
                           f"X{i+1} is exponentially distributed and the model uses "
@@ -570,19 +570,19 @@ if n_types is not None:
                 )
             with c:
                 beta = st.number_input(
-                    f"Weibull shape β{i+1} for H{i+1}", min_value=0.0,
+                    f"β{i+1}", min_value=0.0,
                     value=None, placeholder="β", format="%.6f", key=f"beta_{i}",
                     help=f"H{i+1} is the delay time from defect arrival to failure."
                 )
             with d:
                 eta = st.number_input(
-                    f"Weibull scale η{i+1} for H{i+1}", min_value=0.0,
+                    f"η{i+1}", min_value=0.0,
                     value=None, placeholder="η", format="%.6f", key=f"eta_{i}"
                 )
             with e:
                 ce = st.number_input(
-                    f"Extra failure cost CEF{i+1}", min_value=0.0,
-                    value=None, placeholder="CEF", key=f"cef_{i}"
+                    f"Cef_{i+1}", min_value=0.0,
+                    value=None, placeholder="Cef", key=f"cef_{i}"
                 )
 
             quantities.append(q)
@@ -595,7 +595,7 @@ st.divider()
 st.header("4. Policy variables")
 
 T_user = tau_user = None
-if mode == "Evaluate a specified T and τ":
+if mode == "Evaluate pre-specified T and τ":
     p1, p2 = st.columns(2)
     with p1:
         T_user = st.number_input(
