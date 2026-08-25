@@ -644,7 +644,7 @@ if run:
             if any(v <= 0 for v in eta_h):
                 errors.append("Every Weibull scale ηj must be greater than zero.")
 
-    if mode == "Evaluate a specified T and τ":
+    if mode == "Evaluate pre-specified T and τ":
         if T_user is None or tau_user is None:
             errors.append("Enter both T and τ.")
         elif T_user <= 0:
