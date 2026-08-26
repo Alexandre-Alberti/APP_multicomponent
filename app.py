@@ -541,9 +541,9 @@ For component type **j**:
 )
 
 n_types = st.number_input(
-    "Number of distinct component types (max 50)",
+    "Number of distinct component types (max 20)",
     min_value=1,
-    max_value=50,
+    max_value=20,
     value=None,
     step=1,
     placeholder="Enter number of component types",
